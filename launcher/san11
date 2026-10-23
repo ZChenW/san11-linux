@@ -1,0 +1,1137 @@
+#!/usr/bin/env python3
+"""Reproducible San11PK profiles, using only Python 3.12's standard library."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import filecmp
+from itertools import count
+import json
+import mmap
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shlex
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import time
+import uuid
+import zipfile
+
+# Resolve symlinks so a link to this program in ~/.local/bin still finds the adapter.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import proton
+
+
+CONFIG = ".san11.json"
+REGISTRY = Path(".san11/registry.reg")
+STOP_REQUEST = ".san11-stop"
+LOCALES = {936: "zh_CN.UTF-8", 950: "zh_TW.UTF-8"}
+# Use an explicit environment so dry-run can print it exactly without exposing
+# unrelated inherited tokens. Retain desktop, audio and GPU routing settings.
+ENVIRONMENT = (
+    "PATH", "USER", "LOGNAME", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+    "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE",
+    "XDG_DATA_DIRS", "PULSE_SERVER", "PIPEWIRE_REMOTE", "DRI_PRIME",
+    "VK_ICD_FILENAMES", "VK_DRIVER_FILES", "VK_LAYER_PATH", "VK_INSTANCE_LAYERS",
+    "MESA_VK_DEVICE_SELECT", "__NV_PRIME_RENDER_OFFLOAD", "__GLX_VENDOR_LIBRARY_NAME",
+    "__VK_LAYER_NV_optimus", "WINEDEBUG",
+)
+
+
+def base_environment(profile: Path) -> dict[str, str]:
+    env = {key: os.environ[key] for key in ENVIRONMENT if key in os.environ}
+    env.setdefault("PATH", os.defpath)
+    env.update(HOME=str(Path.home()), TMPDIR=str(profile / ".tmp"),
+               XDG_CACHE_HOME=str(profile / ".cache"))
+    return env
+
+
+def capture(command: list[str], *, env: dict[str, str] | None = None) -> str:
+    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise ValueError(f"{shlex.join(command)} failed: {result.stderr.strip() or result.stdout.strip()}")
+    return result.stdout
+
+
+def locale_environment(codepage: int, root: Path, *, create: bool) -> dict[str, str]:
+    name = LOCALES[codepage]
+    installed = capture(["locale", "-a"])
+    normalize = lambda value: value.lower().replace("-", "").replace(".", "")
+    env = {"LANG": name, "LC_ALL": name}
+    if normalize(name) in {normalize(item) for item in installed.splitlines()}:
+        return env
+    destination = root / name
+    if not (destination / "LC_CTYPE").is_file():
+        if not create:
+            raise ValueError(f"Locale {name} missing; run san11 setup <profile> --codepage {codepage}")
+        if not shutil.which("localedef"):
+            raise ValueError("localedef missing; install: sudo pacman -S glibc")
+        root.mkdir(parents=True, exist_ok=True)
+        capture(["localedef", "--no-archive", "-i", name.split(".")[0], "-f", "UTF-8", str(destination)])
+    env["LOCPATH"] = str(root)
+    probe = {**os.environ, **env}
+    if capture(["locale", "charmap"], env=probe).strip().upper() != "UTF-8":
+        raise ValueError(f"Locale {name} could not be loaded from {root}; rerun setup after installing glibc")
+    return env
+
+
+def fonts() -> dict[str, set[str]]:
+    if not shutil.which("fc-list"):
+        raise ValueError("fc-list missing; install: sudo pacman -S fontconfig noto-fonts-cjk")
+    return {
+        language: {
+            family.strip() for line in capture(["fc-list", f":lang={language}", "-f", "%{family}\\n"]).splitlines()
+            for family in line.split(",") if family.strip()
+        }
+        for language in ("zh-cn", "zh-tw")
+    }
+
+
+def profile_path(root: Path, name: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name) or name.lower() == "pristine":
+        raise ValueError("Profile must be 1-64 ASCII letters/digits/._-, start with a letter/digit, and cannot be pristine")
+    path = root / name
+    if path.is_symlink():
+        raise ValueError(f"Refusing symlinked profile: {path}")
+    return path
+
+
+def load_config(profile: Path, *, ready: bool = False) -> dict:
+    try:
+        value = json.loads((profile / CONFIG).read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"Not a managed profile: {profile}; use san11 setup with a new profile name") from error
+    if not isinstance(value, dict) or value.get("schema") not in (1, 2, 3):
+        raise ValueError(f"Unsupported profile metadata: {profile / CONFIG}")
+    if ready and value["schema"] == 1:
+        raise ValueError(f"Legacy profile layout; run san11 setup {profile.name} to migrate it without recopying saves")
+    if ready and not value.get("ready"):
+        raise ValueError(f"Setup incomplete for {profile.name}; rerun san11 setup {profile.name}")
+    return value
+
+
+def save_config(profile: Path, config: dict) -> None:
+    temporary = profile / (CONFIG + ".new")
+    temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n")
+    temporary.replace(profile / CONFIG)
+
+
+def migrate_profile(profile: Path, config: dict) -> None:
+    """Move round-one profiles in place; never recopy or overwrite game saves."""
+    if config["schema"] != 1:
+        upgrade_config(config)
+        return
+    config["ready"] = False
+    save_config(profile, config)
+    game = profile / "game"
+    game.mkdir(exist_ok=True)
+    owned = {CONFIG, CONFIG + ".new", STOP_REQUEST, "game", "compatdata", "compat", "compat-ge", "logs", "backups", ".tmp", ".cache"}
+    for entry in profile.iterdir():
+        if entry.name not in owned:
+            target = game / entry.name
+            if target.exists() or target.is_symlink():
+                raise ValueError(f"Migration would overwrite {target}; resolve this duplicate before retrying setup")
+            entry.rename(target)
+    old = profile / "compatdata"
+    if old.exists():
+        if (profile / "compat").exists():
+            raise ValueError("Both compat/ and compatdata/ exist; resolve the duplicate prefix before retrying setup")
+        old.rename(profile / "compat")
+    config.update(schema=2)
+    upgrade_config(config)
+    save_config(profile, config)
+
+
+def upgrade_config(config: dict) -> None:
+    """Metadata-only upgrade; dry-run/doctor can use it without writing files."""
+    if config["schema"] == 2:
+        config.setdefault("runners", {}).setdefault("proton", {
+            "proton": config.get("proton", proton.DEFAULT_PROTON),
+            "backend": config.get("backend"), "codepage": config.get("codepage", 936),
+            "ready": config.get("ready", False), "wined3d": config.get("wined3d", True), "wayland": False,
+            "session": config.get("locale", {}),
+        })
+        config.setdefault("active_runner", "proton")
+        config["schema"] = 3
+
+
+def select_tool(args: argparse.Namespace, steam: Path, config: dict) -> proton.Proton:
+    if args.proton:
+        return proton.select_runner(steam, args.runner, args.proton)
+    runner = args.runner or proton.default_runner(steam)
+    # GE's unpinned default always picks the newest numeric version. Preserve
+    # the established Valve tool choice when the user selects that fallback.
+    name = config.get("runners", {}).get(runner, {}).get("proton") if runner == "proton" else None
+    if runner == "proton" and not name and not proton.ge_version(config.get("proton", "")):
+        name = config.get("proton")
+    return proton.select_runner(steam, runner, name)
+
+
+def ffmpeg_paths(args: argparse.Namespace, config: dict) -> dict[str, Path]:
+    saved = config.get("ffmpeg", {})
+    result = {}
+    for arch, default in proton.ffmpeg_directories().items():
+        value = getattr(args, "ffmpeg_" + arch, None) or saved.get(arch) or default
+        path = Path(value).expanduser().absolute()
+        result[arch] = path
+    return result
+
+
+def session_environment(args: argparse.Namespace, config: dict, tool: proton.Proton,
+                        locale_env: dict[str, str]) -> dict[str, str]:
+    return {**locale_env, **proton.driver_environment(tool.runner, x11=args.x11,
+            wined3d=args.wined3d)}
+
+
+def validate_session(tool: proton.Proton, session: dict[str, str]) -> None:
+    if session["PROTON_ENABLE_WAYLAND"] == "1":
+        if not tool.supports_wayland():
+            raise ValueError(f"{tool.directory} lacks winewayland.drv; choose another GE build or use --x11")
+        if not os.environ.get("WAYLAND_DISPLAY"):
+            raise ValueError("WAYLAND_DISPLAY is unset; run in the Wayland session or use --x11")
+
+
+@contextmanager
+def profile_lock(root: Path, name: str):
+    locks = root / ".locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    with (locks / (name + ".lock")).open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError(f"Profile {name} is busy; close its running launcher first") from error
+        yield
+
+
+def writable_copy(source: Path, profile: Path) -> None:
+    if not shutil.which("cp"):
+        raise ValueError("cp missing; install: sudo pacman -S coreutils")
+    result = subprocess.run(["cp", "-a", "--reflink=auto", "--", str(source) + "/.", str(profile)])
+    # Pristine is read-only. cp -a preserves those modes, even on the root.
+    for directory, directories, files in os.walk(profile, followlinks=False):
+        for path in [Path(directory), *(Path(directory) / name for name in directories + files)]:
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode | stat.S_IWUSR)
+    if result.returncode:
+        raise ValueError("Reflink copy failed; fix free space/permissions and rerun setup")
+
+
+@contextmanager
+def writable(directory: Path):
+    mode = directory.stat().st_mode
+    directory.chmod(mode | stat.S_IWUSR)
+    try:
+        yield
+    finally:
+        directory.chmod(mode)
+
+
+def read_only(root: Path) -> None:
+    # Bottom-up, so each folder is still writable while its entries change.
+    for directory, _, files in os.walk(root, topdown=False):
+        for path in [*(Path(directory) / name for name in files), Path(directory)]:
+            path.chmod(path.stat().st_mode & ~0o222)
+
+
+def same_tree(left: Path, right: Path) -> bool:
+    files = lambda root: sorted(path.relative_to(root) for path in root.rglob("*") if path.is_file())
+    names = files(left)
+    return names == files(right) and all(filecmp.cmp(left / name, right / name, shallow=False) for name in names)
+
+
+def extract_zip(archive: Path, target: Path) -> None:
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            for entry in bundle.infolist():
+                name = entry.filename
+                if not entry.flag_bits & 0x800:
+                    # No UTF-8 flag: zipfile decoded the raw bytes as cp437. Chinese Windows tools write GBK.
+                    raw = name.encode("cp437")
+                    try:
+                        name = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        name = raw.decode("gb18030", errors="replace")
+                relative = PurePosixPath(name.replace("\\", "/"))
+                if relative.is_absolute() or ".." in relative.parts or stat.S_ISLNK(entry.external_attr >> 16):
+                    raise ValueError(f"Refusing {name} in {archive}: absolute, escaping or a symlink")
+                path = target.joinpath(*relative.parts)
+                if entry.is_dir():
+                    path.mkdir(parents=True, exist_ok=True)
+                    continue
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with bundle.open(entry) as source, path.open("xb") as destination:
+                    shutil.copyfileobj(source, destination, 1 << 20)
+                stamp = time.mktime((*entry.date_time, 0, 0, -1))
+                os.utime(path, (stamp, stamp))
+    except (zipfile.BadZipFile, RuntimeError, NotImplementedError) as error:
+        raise ValueError(f"Could not extract {archive}: {error}; extract it yourself and pass the folder") from error
+
+
+def extract_archive(archive: Path, target: Path) -> None:
+    if not shutil.which("bsdtar"):
+        raise ValueError("bsdtar missing for .7z/.rar; install: sudo pacman -S libarchive, or extract it and pass the folder")
+    # bsdtar refuses absolute and .. paths unless given -P.
+    if subprocess.run(["bsdtar", "-x", "-f", str(archive), "-C", str(target)]).returncode:
+        raise ValueError(f"Could not extract {archive}; extract it yourself and pass the folder")
+
+
+def releases(root: Path) -> list[Path]:
+    pristine = root / "pristine"
+    if not pristine.is_dir():
+        return []
+    return sorted(path for path in pristine.iterdir() if path.is_dir() and not path.name.startswith("."))
+
+
+def import_release(root: Path, source: Path) -> Path:
+    """Extract or copy a release into pristine/ once, read-only; an identical earlier import is reused."""
+    pristine = root / "pristine"
+    pristine.mkdir(parents=True, exist_ok=True)
+    name = source.stem if source.is_file() else source.name
+    with writable(pristine):
+        temporary = pristine / f".import-{uuid.uuid4().hex[:8]}"
+        temporary.mkdir()
+        try:
+            print(f"Importing {source} into {pristine} (read-only)", flush=True)
+            if source.is_dir():
+                writable_copy(source, temporary)
+            elif zipfile.is_zipfile(source):
+                extract_zip(source, temporary)
+            else:
+                extract_archive(source, temporary)
+            if any(path.is_symlink() for path in temporary.rglob("*")):
+                raise ValueError(f"{source} contains symlinks; refusing to import it")
+            release = proton.find_release(temporary)
+            for target in (pristine / (name if number == 1 else f"{name}-{number}") for number in count(1)):
+                if not target.exists():
+                    break
+                if same_tree(target, temporary):
+                    print(f"Already imported as {target.name}")
+                    return target
+            temporary.rename(target)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+    read_only(target)
+    print(f"Imported {target.name}: game {release.game}, SIRE {release.sire}")
+    return target
+
+
+def resolve_source(root: Path, value: str | None) -> Path:
+    """setup --from: an imported release's name or path, or a release archive/folder to import."""
+    known = releases(root)
+    if value is None:
+        if len(known) == 1:
+            return known[0]
+        raise ValueError("Several mod releases (" + ", ".join(path.name for path in known) + "); choose one with --from NAME"
+                         if known else "No mod release yet; pass --from <the release's .zip/.7z/.rar or extracted folder>")
+    if "/" not in value and root / "pristine" / value in known:
+        return root / "pristine" / value
+    path = Path(value).expanduser().resolve()
+    if path in known:
+        return path
+    if not path.exists():
+        raise ValueError(f"--from {value}: no such archive or folder, and no imported release of that name "
+                         f"({', '.join(path.name for path in known) or 'none yet'})")
+    return import_release(root, path)
+
+
+def copy_saves(source: Path, profile: Path) -> None:
+    """Copy another profile's saves; files already here (including ones the new release ships) are kept."""
+    origin = source / "game" / proton.find_release(source / "game").saves
+    target = profile / "game" / proton.find_release(profile / "game").saves
+    if not origin.is_dir():
+        raise ValueError(f"No SaveData in {source.name}: {origin}")
+    entries = sorted(origin.rglob("*"))
+    if any(path.is_symlink() for path in entries):
+        raise ValueError(f"{origin} contains a symlink; refusing to copy files outside the save tree")
+    copied = 0
+    for path in entries:
+        destination = target / path.relative_to(origin)
+        if path.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+        elif not destination.exists():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+            copied += 1
+        elif not filecmp.cmp(path, destination, shallow=False):
+            print(f"Kept {profile.name}'s {destination.name}; {source.name}'s differs and stays in {origin}")
+    print(f"Saves: copied {copied} file(s) from {source.name}")
+
+
+def dimensions(value: str) -> tuple[int, int]:
+    return tuple(map(int, value.split("x")))
+
+
+def monitor_size(override: str | None = None) -> tuple[tuple[int, int], str]:
+    if override:
+        return dimensions(override), "--resolution"
+    outputs = {}
+    if shutil.which("niri"):
+        try:
+            outputs = json.loads(capture(["niri", "msg", "-j", "outputs"]))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    active = []
+    if isinstance(outputs, dict):
+        for name, output in outputs.items():
+            if not isinstance(output, dict):
+                continue
+            mode, modes = output.get("current_mode"), output.get("modes", [])
+            if isinstance(mode, int) and 0 <= mode < len(modes):
+                current = modes[mode]
+                if isinstance(current, dict) and current.get("width", 0) > 0 and current.get("height", 0) > 0:
+                    active.append((name, output, current))
+    if active:
+        chosen = active[0] if len(active) == 1 else None
+        if chosen is None:
+            try:
+                focused = json.loads(capture(["niri", "msg", "-j", "focused-output"]))
+                chosen = next((item for item in active if item[0] == focused.get("name")), None)
+            except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+                pass
+        if chosen is None:
+            raise ValueError("Multiple niri outputs and no focused monitor; pass --resolution WxH")
+        name, output, mode = chosen
+        width, height = mode["width"], mode["height"]
+        transform = str((output.get("logical") or {}).get("transform", "Normal")).lower()
+        if "90" in transform or "270" in transform:
+            width, height = height, width
+        # Never use logical.width/height: at scale 1.5 those are smaller than
+        # the physical X11 pixels exposed by xwayland-satellite on this host.
+        return (width, height), f"niri {name} (physical pixels)"
+    if shutil.which("xrandr"):
+        try:
+            text = capture(["xrandr", "--query"])
+        except (OSError, ValueError, subprocess.SubprocessError):
+            text = ""
+        matches = list(re.finditer(r"^(\S+) connected (primary )?(\d+)x(\d+)[+-]\d+[+-]\d+", text, re.MULTILINE))
+        selected = next((match for match in matches if match[2]), matches[0] if len(matches) == 1 else None)
+        if selected:
+            return (int(selected[3]), int(selected[4])), f"xrandr {selected[1]}"
+        if len(matches) > 1:
+            raise ValueError("Multiple X11 monitors without a primary output; pass --resolution WxH")
+    if shutil.which("xdpyinfo"):
+        try:
+            match = re.search(r"dimensions:\s+(\d+)x(\d+)\s+pixels", capture(["xdpyinfo"]))
+            if match:
+                return (int(match[1]), int(match[2])), "xdpyinfo"
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    raise ValueError("Cannot detect monitor resolution; use --resolution WxH, or run in the niri/X11 graphical session")
+
+
+def window_size(screen: tuple[int, int]) -> tuple[int, int]:
+    width, height = screen[0], screen[1] - 64
+    sizes = []
+    for x, y in ((4, 3), (8, 5)):
+        factor = min(width // x, height // y)
+        if factor > 0:
+            sizes.append((x * factor, y * factor))
+    if not sizes:
+        raise ValueError("Screen is too small for a window with a 64-pixel height margin")
+    return max(sizes, key=lambda size: size[0] * size[1])
+
+
+def log_directory(profile: Path, purpose: str) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    return profile / "logs" / f"{timestamp}-{purpose}-{uuid.uuid4().hex[:6]}"
+
+
+def print_command(command: list[str], env: dict[str, str], cwd: Path, logs: Path) -> None:
+    print(f"# log directory: {shlex.quote(str(logs))}")
+    print("(cd " + shlex.quote(str(cwd)) + " && " + shlex.join(
+        ["env", "-i", *(f"{key}={value}" for key, value in sorted(env.items())), *command]
+    ) + ") > " + shlex.quote(str(logs / "stdout.log")) + " 2>&1")
+
+
+def execute(command: list[str], env: dict[str, str], cwd: Path, logs: Path) -> int:
+    logs.mkdir(parents=True)
+    Path(env["TMPDIR"]).mkdir(exist_ok=True)
+    Path(env["XDG_CACHE_HOME"]).mkdir(exist_ok=True)
+    # Proton takes its prefix lock inside STEAM_COMPAT_DATA_PATH, so the directory must exist first.
+    if "STEAM_COMPAT_DATA_PATH" in env:
+        Path(env["STEAM_COMPAT_DATA_PATH"]).mkdir(parents=True, exist_ok=True)
+    with (logs / "command.json").open("w") as output:
+        json.dump({"cwd": str(cwd), "env": env, "command": command}, output, ensure_ascii=False, indent=2)
+    print(f"Log: {logs}", flush=True)
+    with (logs / "stdout.log").open("wb") as output:
+        result = subprocess.run(command, env=env, cwd=cwd, stdout=output, stderr=subprocess.STDOUT).returncode
+    print(f"{Path(command[0]).name}: exit code {result}", flush=True)
+    (logs / "exit-code").write_text(str(result) + "\n")
+    return result
+
+
+def invoke(profile: Path, steam: Path, tool: proton.Proton, locale_env: dict[str, str],
+           purpose: str, command: list[str], *, cwd: Path | None = None,
+           wined3d: bool | None = None, dry_run: bool = False) -> int:
+    logs = log_directory(profile, purpose)
+    env = proton.environment({**base_environment(profile), **locale_env}, profile, steam, logs,
+                             wined3d=wined3d, runner=tool.runner)
+    if dry_run:
+        print_command(command, env, cwd or profile, logs)
+        return 0
+    return execute(command, env, cwd or profile, logs)
+
+
+def wait_for_prefix(profile: Path, steam: Path, tool: proton.Proton, locale_env: dict[str, str],
+                    *, dry_run: bool = False) -> int:
+    return invoke(profile, steam, tool, locale_env, "wait", tool.server("-w"), dry_run=dry_run)
+
+
+def configure_prefix(profile: Path, steam: Path, tool: proton.Proton, locale_env: dict[str, str],
+                     substitutions: dict[str, str], *, wined3d: bool | None = None, dry_run: bool = False) -> None:
+    if proton.prefix(profile, tool.runner).is_dir():
+        if wait_for_prefix(profile, steam, tool, locale_env, dry_run=dry_run):
+            raise ValueError("Could not wait for Wine before prefix configuration")
+    registry = profile / "game" / REGISTRY
+    if not dry_run:
+        registry.parent.mkdir(exist_ok=True)
+        registry.write_text(proton.registry(substitutions, proton.find_release(profile / "game")),
+                            encoding="utf-16", newline="")
+    for purpose, command in (
+        ("bootstrap", tool.command("wineboot.exe", "-u")),
+        ("registry", tool.command("regedit.exe", "/S", proton.windows_path(REGISTRY))),
+    ):
+        result = invoke(profile, steam, tool, locale_env, purpose, command, wined3d=wined3d, dry_run=dry_run)
+        if result:
+            raise ValueError(f"Proton {purpose} exited {result}; inspect {profile / 'logs'}")
+        if dry_run:
+            print(f"# launcher maps g: -> {profile / 'game'}; Proton's other mappings remain")
+        else:
+            proton.map_game(profile, tool.runner)
+    if wait_for_prefix(profile, steam, tool, locale_env, dry_run=dry_run):
+        raise ValueError("wineserver wait failed after prefix setup; inspect profile logs")
+
+
+def copy_koei_settings(profile: Path, steam: Path, tool: proton.Proton, session: dict[str, str],
+                       config: dict, registry: dict, *, dry_run: bool) -> dict:
+    if registry.get(proton.OPTIONS.casefold()):
+        return registry  # Never overwrite settings in an already-used target.
+    other = "proton" if tool.runner == "ge" else "ge"
+    source = proton.read_registry(profile, other)
+    if not any(key == r"hkcu\software\koei" or key.startswith("hkcu\\software\\koei\\") for key in source):
+        return registry
+    entry = config.get("runners", {}).get(other, {})
+    exporter = proton.select_runner(steam, other, entry.get("proton"))
+    exporter.validate()
+    source_session = entry.get("session") or {
+        **config.get("locale", {}), **proton.driver_environment(other, ffmpeg=ffmpeg_paths(argparse.Namespace(), config)),
+    }
+    if wait_for_prefix(profile, steam, exporter, source_session, dry_run=dry_run):
+        raise ValueError("Could not wait for source prefix before exporting KOEI settings")
+    relative = Path(".san11") / f"koei-{other}-to-{tool.runner}.reg"
+    if not dry_run:
+        proton.map_game(profile, other)
+    print(f"Copying HKCU\\Software\\KOEI: {other} -> {tool.runner} (target has no game settings)")
+    result = invoke(profile, steam, exporter, source_session, "koei-export",
+                    [str(exporter.wine), "reg", "export", r"HKCU\Software\KOEI", proton.windows_path(relative), "/y"],
+                    dry_run=dry_run)
+    if result:
+        raise ValueError(f"KOEI export exited {result}; inspect profile logs")
+    if wait_for_prefix(profile, steam, exporter, source_session, dry_run=dry_run):
+        raise ValueError("Could not flush source prefix after KOEI export")
+    result = invoke(profile, steam, tool, session, "koei-import",
+                    [str(tool.wine), "reg", "import", proton.windows_path(relative)], dry_run=dry_run)
+    if result:
+        raise ValueError(f"KOEI import exited {result}; inspect profile logs")
+    if wait_for_prefix(profile, steam, tool, session, dry_run=dry_run):
+        raise ValueError("Could not flush target prefix after KOEI import")
+    return source if dry_run else proton.read_registry(profile, tool.runner)
+
+
+def ensure_runner(profile: Path, steam: Path, tool: proton.Proton, session: dict[str, str], config: dict,
+                  codepage: int, *, force: bool = False, dry_run: bool = False) -> dict:
+    entry = config.setdefault("runners", {}).setdefault(tool.runner, {})
+    wined3d = session["PROTON_USE_WINED3D"] == "1"
+    wayland = session["PROTON_ENABLE_WAYLAND"] == "1"
+    refresh = (force or not entry.get("ready") or not (proton.prefix(profile, tool.runner) / "drive_c").is_dir()
+               or entry.get("backend") != tool.identity() or entry.get("codepage") != codepage
+               or entry.get("wined3d") != wined3d or entry.get("wayland") != wayland)
+    if not dry_run:
+        entry.update(proton=tool.directory.name, session=session, ready=False)
+        config["active_runner"] = tool.runner  # stop must find a run even during initialization.
+        save_config(profile, config)
+    if refresh:
+        configure_prefix(profile, steam, tool, session, config["fonts"], dry_run=dry_run)
+    elif wait_for_prefix(profile, steam, tool, session, dry_run=dry_run):
+        raise ValueError("Could not wait for existing Wine processes; inspect profile logs")
+    if not dry_run:
+        proton.map_game(profile, tool.runner)
+    registry = proton.read_registry(profile, tool.runner)
+    registry = copy_koei_settings(profile, steam, tool, session, config, registry, dry_run=dry_run)
+    if not dry_run:
+        locale_env = {key: value for key, value in session.items() if key in ("LANG", "LC_ALL", "LOCPATH")}
+        entry.update(ready=True, backend=tool.identity(), codepage=codepage, wined3d=wined3d, wayland=wayland)
+        config.update(ready=True, proton=entry["proton"], backend=entry["backend"],
+                      codepage=codepage, wined3d=wined3d, locale=locale_env)
+        save_config(profile, config)
+    return registry
+
+
+def prepare_runner(args: argparse.Namespace) -> int:
+    source = proton.select_ge_source(args.steam_root.expanduser().absolute(), args.ge)
+    root = args.ffmpeg.expanduser().resolve()
+    print(f"Preparing dedicated runner from {source.directory} with FFmpeg 8 from {root}", flush=True)
+    tool = proton.prepare_runner(source, {arch: root / arch for arch in ("i386", "x86_64")}, force=args.force)
+    print(f"Ready: {tool.directory} (use --force to rebuild an existing copy)")
+    return 0
+
+
+def setup(args: argparse.Namespace) -> int:
+    root, steam, locale_root = paths(args)
+    profile = profile_path(root, args.profile)
+    with profile_lock(root, args.profile):
+        (profile / STOP_REQUEST).unlink(missing_ok=True)
+        if profile.exists():
+            config = load_config(profile)
+            upgrade_config(config)
+        else:
+            config = {"schema": 3, "ready": False, "copied": False}
+        if config.get("copied") and args.source:
+            raise ValueError(f"{args.profile} already holds its game files; rerun without --from, or set up a new "
+                             f"profile for that release: san11 setup <new> --from {args.source} --saves-from {args.profile}")
+        saves = profile_path(root, args.saves_from) if args.saves_from else None
+        if saves is not None:
+            if saves == profile:
+                raise ValueError("--saves-from names this profile itself")
+            load_config(saves)
+        tool = select_tool(args, steam, config)
+        tool.validate()
+        substitutions = proton.font_substitutions(fonts())
+        if not config.get("copied"):
+            source = resolve_source(root, args.source or config.get("source"))
+            release = proton.find_release(source)
+            config["source"] = str(source)
+        if not profile.exists():
+            profile.mkdir()
+            save_config(profile, config)
+        codepage = args.codepage or config.get("codepage", 936)
+        locale_env = locale_environment(codepage, locale_root, create=True)
+        session = session_environment(args, config, tool, locale_env)
+        validate_session(tool, session)
+        if tool.runner == "ge" and tool.directory.parent != proton.runner_root():
+            directories = ffmpeg_paths(args, config)
+            if not any(proton.ffmpeg_errors(path, arch) for arch, path in directories.items()):
+                print(f"Preparing dedicated GE runner from {tool.directory}", flush=True)
+                tool = proton.prepare_runner(tool, directories)
+            else:
+                print("WARNING: private FFmpeg 8 libraries are incomplete; using plain GE; movies will not play. "
+                      "Provide both architectures, then run san11 prepare-runner.")
+        migrate_profile(profile, config)
+        if not config.get("copied"):
+            game = profile / "game"
+            game.mkdir(exist_ok=True)
+            writable_copy(source / release.root, game)
+            proton.find_release(game)
+            config["copied"] = True
+        if saves is not None:
+            copy_saves(saves, profile)
+        config.update(codepage=codepage, fonts=substitutions, locale=locale_env,
+                      ffmpeg={arch: str(path) for arch, path in ffmpeg_paths(args, config).items()})
+        save_config(profile, config)
+        ensure_runner(profile, steam, tool, session, config, codepage, force=True)
+    print(f"Ready: {profile}\nStart: san11 run {args.profile}（在 SIRE 里点左上角 311 按钮；游戏期间保持 SIRE 打开）")
+    return 0
+
+
+def paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
+    home = Path.home()
+    return (
+        args.games_root.expanduser().resolve(),
+        args.steam_root.expanduser().absolute(),
+        home / ".local/share/san11/locale",
+    )
+
+
+def write_display(profile: Path, steam: Path, tool: proton.Proton, session: dict[str, str], guid: bytes | None,
+                  size: tuple[int, int], *, windowed: bool, dry_run: bool) -> bool:
+    for index, command in enumerate(proton.display_commands(
+            tool, guid, size, windowed=windowed, x11=session["PROTON_ENABLE_WAYLAND"] != "1")):
+        if not dry_run and (profile / STOP_REQUEST).exists():
+            return False
+        result = invoke(profile, steam, tool, session, f"display-{index}", command, dry_run=dry_run)
+        if result:
+            wait_for_prefix(profile, steam, tool, session)
+            raise ValueError(f"Display registry update exited {result}; inspect profile logs")
+    return True
+
+
+def launch_and_wait(profile: Path, steam: Path, tool: proton.Proton, session: dict[str, str], *,
+                    sire: bool, desktop: str | None, dry_run: bool, purpose: str = "launch",
+                    s11fast: bool = False) -> int:
+    source = proton.s11fast_source()
+    s11fast = s11fast and sire and proton.s11fast_ready(source)
+    if sire:
+        print("s11fast: " + ("on, SIRE loads the mod faster" if s11fast else
+                             "off" if proton.s11fast_ready(source) else f"missing ({source}); run tools/build-s11fast.sh"))
+    if s11fast and not dry_run:
+        proton.install_s11fast(source, profile, tool.runner)
+    command, directory = proton.launch(tool, proton.find_release(profile / "game"), sire=sire, desktop=desktop,
+                                       s11fast=s11fast)
+    if dry_run:
+        invoke(profile, steam, tool, session, purpose, command, cwd=profile / "game" / directory, dry_run=True)
+        wait_for_prefix(profile, steam, tool, session, dry_run=True)
+        return 0
+    if (profile / STOP_REQUEST).exists():
+        return 0
+    try:
+        result = invoke(profile, steam, tool, session, purpose, command, cwd=profile / "game" / directory)
+    finally:
+        print("Waiting for all Wine processes in this prefix to exit (close the game and SIRE).", flush=True)
+        waited = wait_for_prefix(profile, steam, tool, session)
+    print(f"Profile {profile.name} ({tool.runner}): Proton exit code {result}; wineserver wait exit code {waited}")
+    return result or waited
+
+
+def run(args: argparse.Namespace) -> int:
+    root, steam, locale_root = paths(args)
+    profile = profile_path(root, args.profile)
+
+    def start() -> int:
+        # Recheck after acquiring the lock; dry-run does not create even a lock file.
+        config = load_config(profile, ready=True)
+        upgrade_config(config)
+        proton.find_release(profile / "game")
+        tool = select_tool(args, steam, config)
+        tool.validate()
+        screen, source = monitor_size(args.resolution or args.virtual_desktop)
+        codepage = args.codepage or config["codepage"]
+        locale_env = locale_environment(codepage, locale_root, create=not args.dry_run)
+        session = session_environment(args, config, tool, locale_env)
+        validate_session(tool, session)
+        if not args.dry_run:
+            (profile / STOP_REQUEST).unlink(missing_ok=True)
+            config["ffmpeg"] = {arch: str(path) for arch, path in ffmpeg_paths(args, config).items()}
+        registry = ensure_runner(profile, steam, tool, session, config, codepage, dry_run=args.dry_run)
+        if not args.dry_run and (profile / STOP_REQUEST).exists():
+            return 0
+        guid = proton.adapter_guid(registry, windowed=args.windowed)
+        if guid is None:
+            print("尚无适配器 GUID：首次直接以窗口模式启动游戏；看到标题画面后请退出。"
+                  "随后会保留生成的 GUID，写入原生全屏设置，再启动 SIRE（或 --game 目标）。")
+            if args.notify:
+                notify("首次启动：看到标题画面后请退出游戏，随后会自动打开 SIRE。")
+            if not write_display(profile, steam, tool, session, None, window_size(screen),
+                                 windowed=True, dry_run=args.dry_run):
+                return 0
+            result = launch_and_wait(profile, steam, tool, session, sire=False, desktop=args.virtual_desktop,
+                                     dry_run=args.dry_run, purpose="seed")
+            if result or (not args.dry_run and (profile / STOP_REQUEST).exists()):
+                return result
+            if args.dry_run:
+                requested_size = window_size(screen) if args.windowed else screen
+                mode = int(args.windowed)
+                print(f"# after title-screen exit: read the generated GUID and write DisplayMode {mode} = GUID + "
+                      f"(0,1,22,22,77,{mode},{requested_size[0]},{requested_size[1]}); "
+                      "exact REG_BINARY is deferred until the GUID exists")
+                return launch_and_wait(profile, steam, tool, session, sire=not args.game, desktop=args.virtual_desktop,
+                                       dry_run=True, s11fast=not args.no_s11fast)
+            guid = proton.adapter_guid(proton.read_registry(profile, tool.runner), windowed=args.windowed)
+            if guid is None:
+                raise ValueError("Game did not save a DisplayMode GUID; run --game --windowed, reach the title screen and exit, then retry")
+        windowed = args.windowed
+        size = window_size(screen) if windowed else screen
+        print(f"Monitor: {screen[0]}x{screen[1]} via {source}; "
+              f"{'windowed request' if windowed else 'fullscreen'} {size[0]}x{size[1]} "
+              f"({tool.runner}, {'Wayland' if session['PROTON_ENABLE_WAYLAND'] == '1' else 'X11'}, "
+              f"{'WineD3D' if session['PROTON_USE_WINED3D'] == '1' else 'DXVK'})")
+        if windowed:
+            print("Window size is a request; the game may clamp it to its supported desktop sizes.")
+        elif tool.runner == "proton":
+            print("Valve/X11 fallback: fullscreen may need focus SIRE -> game; window rect/click mapping remains limited. "
+                  "Use --windowed if needed. GE Wayland needs no focus toggle.")
+        if not write_display(profile, steam, tool, session, guid, size, windowed=windowed, dry_run=args.dry_run):
+            return 0
+        return launch_and_wait(profile, steam, tool, session, sire=not args.game,
+                               desktop=args.virtual_desktop, dry_run=args.dry_run, s11fast=not args.no_s11fast)
+
+    if args.dry_run:
+        return start()
+    with profile_lock(root, args.profile):
+        return start()
+
+
+def stop(args: argparse.Namespace) -> int:
+    root, steam, _ = paths(args)
+    profile = profile_path(root, args.profile)
+    config = load_config(profile)
+    upgrade_config(config)
+    runner = args.runner or config.get("active_runner", "proton")
+    entry = config.get("runners", {}).get(runner, {})
+    tool = proton.select_runner(steam, args.runner if args.proton else runner,
+                                args.proton or entry.get("proton"))
+    tool.validate()
+    locale_env = entry.get("session") or config.get("locale", {"LANG": LOCALES[936], "LC_ALL": LOCALES[936]})
+    # Deliberately do not acquire the run lock: stop must interrupt a live run.
+    (profile / STOP_REQUEST).write_text(datetime.now(timezone.utc).isoformat() + "\n")
+    result = invoke(profile, steam, tool, locale_env, "stop", tool.server("-k"))
+    if result:
+        return result
+    return wait_for_prefix(profile, steam, tool, locale_env)
+
+
+def backup(args: argparse.Namespace) -> int:
+    root, _, _ = paths(args)
+    profile = profile_path(root, args.profile)
+    with profile_lock(root, args.profile):
+        load_config(profile, ready=True)
+        source = profile / "game" / proton.find_release(profile / "game").saves
+        if not source.is_dir():
+            raise ValueError(f"No SaveData at {source}; save a game first")
+        entries = [source, *sorted(source.rglob("*"))]
+        if any(path.is_symlink() for path in entries):
+            raise ValueError("SaveData contains a symlink; refusing to archive files outside the save tree")
+        folder = profile / "backups"
+        folder.mkdir(exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        target = folder / f"SaveData-{timestamp}-{uuid.uuid4().hex[:6]}.zip"
+        temporary = target.with_suffix(".zip.part")
+        try:
+            with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for path in entries:
+                    archive.write(path, Path("SaveData") / path.relative_to(source))
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    print(f"Backup: {target}")
+    return 0
+
+
+def notify(message: str) -> None:
+    # Desktop entries have no terminal to print to.
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "--app-name=san11", "三國志11", message], check=False)
+
+
+def pe_icon(path: Path) -> bytes | None:
+    """The largest icon of a PE file as a one-image .ico, or None if it has none."""
+    try:
+        with path.open("rb") as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as image:
+            header = struct.unpack_from("<I", image, 0x3C)[0]
+            sections, optional_size = struct.unpack_from("<H12xH", image, header + 6)
+            optional = header + 24
+            directories = optional + (96 if struct.unpack_from("<H", image, optional)[0] == 0x10B else 112)
+            resources = struct.unpack_from("<I", image, directories + 16)[0]
+            table = [struct.unpack_from("<IIII", image, optional + optional_size + 40 * i + 8) for i in range(sections)]
+
+            def offset(rva):
+                return next(rva - address + raw for size, address, raw_size, raw in table
+                            if address <= rva < address + max(size, raw_size))
+
+            base = offset(resources)
+
+            def entries(directory):
+                named, ids = struct.unpack_from("<HH", image, base + directory + 12)
+                return [struct.unpack_from("<II", image, base + directory + 16 + 8 * i) for i in range(named + ids)]
+
+            def data(entry):
+                while entry & 0x80000000:  # name and language levels: take the first
+                    entry = entries(entry & 0x7FFFFFFF)[0][1]
+                rva, size = struct.unpack_from("<II", image, base + entry)
+                return bytes(image[offset(rva):offset(rva) + size])
+
+            types = {kind: dict(entries(entry & 0x7FFFFFFF)) for kind, entry in entries(0) if kind in (3, 14)}
+            group = data(next(iter(types[14].values())))  # RT_GROUP_ICON
+            images = [struct.unpack_from("<BBBBHHIH", group, 6 + 14 * i) for i in range(struct.unpack_from("<H", group, 4)[0])]
+            best = max(images, key=lambda item: (item[0] or 256, item[5]))
+            return struct.pack("<HHHBBBBHHII", 0, 1, 1, *best[:7], 22) + data(types[3][best[7]])  # RT_ICON
+    except (OSError, ValueError, struct.error, KeyError, IndexError, StopIteration):
+        return None
+
+
+def write_icon(executable: Path, target: Path) -> bool:
+    icon = pe_icon(executable)
+    if icon is None:
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if icon[22:30] == b"\x89PNG\r\n\x1a\n":  # Vista-style icons hold a PNG as is
+        target.write_bytes(icon[22:])
+        return True
+    converter = shutil.which("magick") or shutil.which("ffmpeg")
+    if converter is None:
+        return False
+    source = target.with_suffix(".ico")
+    source.write_bytes(icon)
+    command = ([converter, f"ico:{source}[0]", f"png:{target}"] if converter.endswith("magick") else
+               [converter, "-loglevel", "error", "-y", "-i", str(source), str(target)])
+    try:
+        return subprocess.run(command).returncode == 0 and target.is_file()
+    finally:
+        source.unlink(missing_ok=True)
+
+
+def desktop_exec(command: list[str]) -> str:
+    """Quote an argv for a desktop entry's Exec key (quoting rule, then the string escape rule)."""
+    def quote(argument: str) -> str:
+        argument = argument.replace("%", "%%")
+        if not re.search(r"[\s\"'\\<>~|&;$*?#()`]", argument):
+            return argument
+        return '"' + re.sub(r'(["`$\\])', r"\\\1", argument).replace("\\", "\\\\") + '"'
+    return " ".join(map(quote, command))
+
+
+def desktop_entry(args: argparse.Namespace) -> int:
+    root, steam, _ = paths(args)
+    profile = profile_path(root, args.profile)
+    suffix = "-windowed" if args.windowed else ""
+    entry = Path.home() / ".local/share/applications" / f"san11-{args.profile}{suffix}.desktop"
+    icon = Path.home() / ".local/share/san11/icons" / f"{args.profile}.png"
+    if args.remove:
+        entry.unlink(missing_ok=True)
+        print(f"Removed {entry}")
+        return 0
+    config = load_config(profile, ready=True)
+    release = proton.find_release(profile / "game")
+    # SIRE is what the entry starts; its icon is also the sharper one (the game's is 32x32 at most).
+    has_icon = any(write_icon(profile / "game" / executable, icon) for executable in (release.sire, release.game))
+    command = [str(Path(__file__).resolve()), "--games-root", str(root), "--steam-root", str(steam),
+               "run", args.profile, "--notify", *(["--windowed"] if args.windowed else [])]
+    title = f"三國志11 {Path(config.get('source', args.profile)).name}（{args.profile}{'，窗口' if args.windowed else ''}）"
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("\n".join([
+        "[Desktop Entry]",
+        "Type=Application",
+        f"Name={title}",
+        "GenericName=三国志11 威力加强版",  # fuzzel and others match Name and GenericName, rarely Keywords
+        f"Comment=SIRE + San11PK ({args.profile})",
+        f"Exec={desktop_exec(command)}",
+        f"Icon={icon if has_icon else 'applications-games'}",
+        "Terminal=false",
+        "Categories=Game;StrategyGame;",
+        f"Keywords=san11;sanguo;三国志;三國志;SIRE;{args.profile};",
+    ]) + "\n")
+    print(f"Desktop entry: {entry}" + ("" if has_icon else " (no icon found)"))
+    return 0
+
+
+def doctor(args: argparse.Namespace) -> int:
+    root, steam, locale_root = paths(args)
+    missing = 0
+
+    def report(ok: bool, description: str, fix: str = "", *, optional: bool = False):
+        nonlocal missing
+        print(f"{'OK' if ok else 'OPTIONAL' if optional else 'MISSING'}: {description}" +
+              (f"; {fix}" if not ok and fix else ""))
+        if not ok and not optional:
+            missing += 1
+
+    found = proton.installations(steam)
+    selected_config = {}
+    if args.profile:
+        try:
+            selected_config = load_config(profile_path(root, args.profile))
+            upgrade_config(selected_config)
+        except (OSError, ValueError):
+            pass  # The per-profile checks below report the concrete error.
+    report(steam.is_dir(), f"Steam client files: {steam}", "install Steam: sudo pacman -S steam")
+    report(bool(found), "Proton tools: " + (", ".join(found) or "none"),
+           "install Proton 10.0 from Steam > Library > Tools, then Steam can stay closed")
+    try:
+        requested = select_tool(args, steam, selected_config)
+        report(True, f"selected runner: {requested.runner}, {requested.directory}")
+    except ValueError as error:
+        requested = None
+        report(False, str(error), "choose --runner proton or install the requested tool")
+    ge_tools = proton.ge_installations(steam)
+    want_ge = (requested is not None and requested.runner == "ge") or args.runner == "ge"
+    report(bool(ge_tools), "GE dirs: " + (", ".join(str(tool.directory) for tool in ge_tools) or "none"),
+           f"install GE-Proton11-* under {steam / 'compatibilitytools.d'}", optional=not want_ge)
+    wayland = requested is not None and requested.runner == "ge" and not args.x11
+    if requested:
+        for executable in (requested.script, requested.wine, requested.wineserver):
+            report(executable.is_file() and os.access(executable, os.X_OK), str(executable),
+                   "repair this Proton installation in Steam")
+        report(requested.supports_wayland(), f"{requested.directory.name}: PROTON_ENABLE_WAYLAND / winewayland.drv support",
+               "select a GE build containing winewayland.drv, or use --x11", optional=not wayland)
+    for arch, directory in ffmpeg_paths(args, selected_config).items():
+        errors = proton.ffmpeg_errors(directory, arch)
+        report(not errors, f"FFmpeg 8 {arch}: {directory}" + ("; " + ", ".join(errors) if errors else "; all five sonames/ELF class OK"),
+               f"point --ffmpeg-{arch} to the private FFmpeg 8 {arch} libraries", optional=not want_ge)
+        if requested and requested.runner == "ge":
+            error = proton.movie_library_error(requested, directory, arch)
+            report(error is None, f"runner FFmpeg 8 {arch}: " +
+                   (f"{error}; movies will not play" if error else "libavformat.so.62 SHA256 matches private build"),
+                   "san11 prepare-runner --force (GE prepends bundled library paths; LD_LIBRARY_PATH cannot fix this)")
+    fast = proton.s11fast_source()
+    report(proton.s11fast_ready(fast), f"s11fast: {fast}",
+           "tools/build-s11fast.sh (without it the title bounces back for seconds while SIRE loads the mod)",
+           optional=True)
+    try:
+        screen, source = monitor_size(args.resolution)
+        report(True, f"monitor physical resolution: {screen[0]}x{screen[1]} via {source}")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        screen = None
+        report(False, str(error), "pass --resolution WxH using the monitor's physical resolution")
+    report(sys.version_info >= (3, 12), f"Python {sys.version.split()[0]}", "sudo pacman -S python")
+    for command, package in (("cp", "coreutils"), ("locale", "glibc"), ("localedef", "glibc"), ("fc-list", "fontconfig")):
+        report(bool(shutil.which(command)), command, f"sudo pacman -S {package}")
+    try:
+        substitutions = proton.font_substitutions(fonts())
+        report(True, "CJK fonts: " + ", ".join(sorted(set(substitutions.values()))))
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        report(False, str(error), "sudo pacman -S fontconfig noto-fonts-cjk")
+    for codepage, name in LOCALES.items():
+        try:
+            env = locale_environment(codepage, locale_root, create=False)
+            report(True, f"{name} (Wine CP{codepage})" + (f" via {env['LOCPATH']}" if "LOCPATH" in env else ""))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            report(False, str(error), f"setup compiles this per-user using localedef; sources: sudo pacman -S glibc")
+    display = ", ".join(f"{key}={os.environ[key]}" for key in ("DISPLAY", "WAYLAND_DISPLAY") if os.environ.get(key))
+    report(bool(os.environ.get("WAYLAND_DISPLAY")), "WAYLAND_DISPLAY=" + os.environ.get("WAYLAND_DISPLAY", "<unset>"),
+           "run in the Wayland session, or use --x11", optional=not wayland)
+    report(bool(os.environ.get("DISPLAY")), display or "DISPLAY/WAYLAND_DISPLAY unset",
+           "run in the graphical session; on niri start xwayland-satellite (sudo pacman -S xwayland-satellite)", optional=wayland)
+    report(bool(shutil.which("gamescope")), "gamescope", "optional: sudo pacman -S gamescope", optional=True)
+    if shutil.which("vulkaninfo"):
+        try:
+            summary = capture(["vulkaninfo", "--summary"])
+            report(True, "vulkaninfo --summary\n" + summary.rstrip())
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            report(False, str(error), "install the GPU Vulkan driver and its lib32 counterpart for GE/DXVK; Valve WineD3D uses OpenGL")
+    else:
+        report(False, "vulkaninfo", "sudo pacman -S vulkan-tools; rerun doctor to check your GPU")
+    known = releases(root)
+    report(bool(known), "mod releases: " + (", ".join(path.name for path in known) or "none"),
+           "san11 setup <profile> --from <the release's .zip/.7z/.rar or extracted folder>")
+    print("Vulkan drivers (choose your GPU): sudo pacman -S vulkan-radeon lib32-vulkan-radeon (AMD), "
+          "vulkan-intel lib32-vulkan-intel (Intel), or nvidia-utils lib32-nvidia-utils (NVIDIA).")
+    profiles = ([profile_path(root, args.profile)] if args.profile else
+                sorted(path.parent for path in root.glob(f"*/{CONFIG}") if not path.parent.is_symlink()))
+    if not profiles:
+        print("INFO: no managed profile; run setup, then doctor <profile> to inspect display registry values")
+    for profile in profiles:
+        try:
+            config = load_config(profile, ready=True)
+            upgrade_config(config)
+            tool = select_tool(args, steam, config)
+            tool.validate()
+            report(True, f"{profile.name} {tool.runner}: {tool.directory}; prefix={proton.prefix(profile, tool.runner)}")
+            release = proton.find_release(profile / "game")
+            report(True, f"{profile.name} release: {Path(config.get('source', '?')).name}; "
+                   f"game {release.game}, SIRE {release.sire}")
+            drive = proton.prefix(profile, tool.runner) / "dosdevices/g:"
+            report(drive.is_symlink() and drive.resolve() == profile / "game",
+                   f"{profile.name} g: -> {profile / 'game'}", f"san11 setup {profile.name}")
+            registry = proton.read_registry(profile, tool.runner)
+            options = registry.get(proton.OPTIONS.casefold(), {})
+            windowed = options.get("windowmode")
+            report(windowed in (0, 1), f"{profile.name} WindowMode={windowed!r}", f"san11 run {profile.name}")
+            use_xvidmode = registry.get(proton.X11_DRIVER.casefold(), {}).get("usexvidmode")
+            if tool.runner == "proton" or args.x11:
+                report(use_xvidmode == "N", f"{profile.name} UseXVidMode={use_xvidmode!r}", f"san11 run {profile.name} --runner {tool.runner}")
+            else:
+                print(f"INFO: {profile.name} UseXVidMode={use_xvidmode!r}; unused by GE Wayland")
+            for mode in (0, 1):
+                value = options.get(f"displaymode {mode}")
+                decoded = proton.decode_display(value)
+                if decoded is None:
+                    report(False, f"{profile.name} DisplayMode {mode}: missing or malformed 48-byte REG_BINARY",
+                           f"run san11 run {profile.name} --windowed, click 311, enter and close the game first",
+                           optional=mode != windowed)
+                    continue
+                guid, values = decoded
+                report(values[:6] == (0, 1, 22, 22, 77, mode) and min(values[6:]) > 0,
+                       f"{profile.name} DisplayMode {mode}: GUID={guid.hex()} values={values}",
+                       f"san11 run {profile.name}" + (" --windowed" if mode else ""))
+                if screen and mode == windowed:
+                    fits = ((0 < values[6] <= screen[0] and 0 < values[7] <= screen[1] - 64)
+                            if mode else values[6:] == screen)
+                    report(fits, f"{profile.name} active display {values[6]}x{values[7]} "
+                           f"{'fits the window margin (game may clamp)' if mode else 'matches physical pixels'}",
+                           f"san11 run {profile.name}" + (" --windowed" if mode else ""))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            report(False, f"{profile.name}: {error}", f"san11 setup {profile.name}")
+    print("INFO: registry checks read user.reg; close the game and SIRE first for a flushed snapshot. "
+          "TODO: filesystem isolation needs bwrap; Z: and other Proton mappings remain accessible.")
+    return 1 if missing else 0
+
+
+def desktop(value: str) -> str:
+    if (not re.fullmatch(r"[1-9][0-9]{0,4}x[1-9][0-9]{0,4}", value)
+            or any(number > 16384 for number in dimensions(value))):
+        raise argparse.ArgumentTypeError("Use positive dimensions such as 1280x720")
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--games-root", type=Path, default=Path.home() / "Games/san11")
+    parser.add_argument("--steam-root", type=Path, default=Path.home() / ".steam/steam")
+    subcommands = parser.add_subparsers(dest="action", required=True)
+    for action in ("setup", "run", "doctor", "stop", "backup", "prepare-runner", "desktop"):
+        command = subcommands.add_parser(action)
+        if action == "desktop":
+            command.add_argument("profile")
+            command.add_argument("--windowed", action="store_true", help="the entry starts the game windowed")
+            command.add_argument("--remove", action="store_true", help="delete the entry instead")
+            continue
+        if action == "prepare-runner":
+            command.add_argument("--ge", metavar="NAME_OR_PATH", help="source GE runner (default: newest installed GE-Proton11-*)")
+            command.add_argument("--ffmpeg", type=Path, default=Path.home() / ".local/share/san11/ffmpeg8",
+                                 metavar="DIR", help="private FFmpeg 8 root containing i386/ and x86_64/")
+            command.add_argument("--force", action="store_true", help="rebuild the dedicated copy; leave the source GE unchanged")
+            continue
+        if action != "backup":
+            command.add_argument("--proton", metavar="NAME", help="explicit installed tool name; otherwise newest GE11 or saved Valve tool")
+            command.add_argument("--runner", choices=("ge", "proton"), help="default: ge when GE-Proton11-* is installed, otherwise proton")
+        if action in ("setup", "run", "doctor"):
+            command.add_argument("--x11", action="store_true", help="disable GE's default Wayland driver")
+            command.add_argument("--ffmpeg-i386", type=Path, help="private FFmpeg 8 i386 library directory")
+            command.add_argument("--ffmpeg-x86_64", "--ffmpeg-x86-64", type=Path, dest="ffmpeg_x86_64",
+                                 help="private FFmpeg 8 x86_64 library directory")
+            renderer = command.add_mutually_exclusive_group()
+            renderer.add_argument("--wined3d", action="store_true", dest="wined3d", help="use WineD3D (Valve default)")
+            renderer.add_argument("--dxvk", action="store_false", dest="wined3d", help="use DXVK (GE default)")
+            command.set_defaults(wined3d=None)
+        if action == "doctor":
+            command.add_argument("profile", nargs="?", help="inspect one profile (default: inspect all managed profiles)")
+            command.add_argument("--resolution", type=desktop, metavar="WxH")
+        else:
+            command.add_argument("profile")
+        if action in ("setup", "run"):
+            command.add_argument("--codepage", type=int, choices=(936, 950), help="936=zh_CN.UTF-8; 950=zh_TW.UTF-8 (saved per profile)")
+        if action == "setup":
+            command.add_argument("--from", dest="source", metavar="RELEASE",
+                                 help="mod release: its .zip/.7z/.rar or extracted folder (imported read-only into "
+                                      "pristine/ once), or the name of an imported one")
+            command.add_argument("--saves-from", metavar="PROFILE",
+                                 help="copy that profile's saves; files already in this profile are kept")
+        if action == "run":
+            target = command.add_mutually_exclusive_group()
+            target.add_argument("--sire", action="store_true", help="start SIRE (default)")
+            target.add_argument("--game", action="store_true", help="start san11pk.exe directly")
+            command.add_argument("--no-s11fast", action="store_true",
+                                 help="start SIRE without s11fast (slow mod loading under Wine, for comparison)")
+            mode = command.add_mutually_exclusive_group()
+            mode.add_argument("--windowed", dest="windowed", action="store_true", default=False,
+                              help="largest 4:3/16:10 request fitting screen height minus 64 px")
+            mode.add_argument("--fullscreen", dest="windowed", action="store_false",
+                              help="default; native fullscreen at the monitor's physical resolution")
+            command.add_argument("--resolution", type=desktop, metavar="WxH", help="physical monitor resolution; auto-detect by default")
+            command.add_argument("--virtual-desktop", type=desktop, metavar="WxH")
+            command.add_argument("--dry-run", action="store_true", help="print exact child environment/command; write nothing")
+            command.add_argument("--notify", action="store_true",
+                                 help="also show errors and first-run steps as desktop notifications (desktop entries)")
+    args = parser.parse_args(argv)
+    try:
+        return {"setup": setup, "run": run, "doctor": doctor, "stop": stop, "backup": backup,
+                "prepare-runner": prepare_runner, "desktop": desktop_entry}[args.action](args)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"san11: {error}", file=sys.stderr)
+        if getattr(args, "notify", False):
+            notify(str(error))
+        return 1
+    except KeyboardInterrupt:
+        print("san11: interrupted; inspect the profile logs before retrying", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
